@@ -52,7 +52,6 @@ def get_spotify() -> spotipy.Spotify:
             "playlist-read-private"
         ),
     )
-    # Refresh token ile erişim token'ı al
     token_info = auth.refresh_access_token(SPOTIFY_REFRESH_TOKEN)
     return spotipy.Spotify(auth=token_info["access_token"])
 
