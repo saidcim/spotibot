@@ -2,5 +2,7 @@
 builder = "nixpacks"
 
 [deploy]
+# Başlamadan önce groq ve httpx kütüphanelerini en güncel sürümlerine yükseltir
+preDeployCommand = "pip install --upgrade groq httpx"
 startCommand = "python bot.py"
 restartPolicyType = "always"
