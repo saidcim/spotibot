@@ -246,7 +246,7 @@ SADECE JSON döndür, başka hiçbir şey yazma:
 {{"track_ids": ["id1", "id2"], "score": 7.5, "analysis": "Türkçe kısa analiz", "notes": "sonraki döngü notu"}}"""
 
     response = client.chat.completions.create(
-        model="llama3-70b-8192",
+        model="llama-3.3-70b-versatile",  # <-- Güncel ve aktif model
         max_tokens=2000,
         messages=[{"role": "user", "content": prompt}]
     )
