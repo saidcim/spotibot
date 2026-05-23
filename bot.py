@@ -26,7 +26,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
 # ── Config ─────────────────────────────────────────────────────────────────
 SPOTIFY_CLIENT_ID     = os.environ["SPOTIFY_CLIENT_ID"]
