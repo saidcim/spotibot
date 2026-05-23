@@ -1,6 +1,7 @@
 """
 Spotify AI Playlist Bot
 Her 3 günde bir dinleme geçmişini analiz eder, AI ile playlist günceller.
+Flask API ile Vercel dashboard'a endpoint sağlar.
 """
 
 import os
@@ -8,11 +9,14 @@ import json
 import time
 import logging
 import datetime
+import threading
 import openpyxl
 import schedule
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from groq import Groq
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,17 +25,24 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+app = Flask(__name__)
+CORS(app)
+
 # ── Config ─────────────────────────────────────────────────────────────────
 SPOTIFY_CLIENT_ID     = os.environ["SPOTIFY_CLIENT_ID"]
 SPOTIFY_CLIENT_SECRET = os.environ["SPOTIFY_CLIENT_SECRET"]
 SPOTIFY_REDIRECT_URI  = os.environ.get("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:5000/callback")
 SPOTIFY_REFRESH_TOKEN = os.environ["SPOTIFY_REFRESH_TOKEN"]
 GROQ_API_KEY          = os.environ["GROQ_API_KEY"]
+API_SECRET            = os.environ.get("API_SECRET", "gizli-anahtar-degistir")
 PLAYLIST_ID           = os.environ.get("PLAYLIST_ID", "")
 PLAYLIST_NAME         = os.environ.get("PLAYLIST_NAME", "🤖 AI Daily Mix")
 PLAYLIST_SIZE         = int(os.environ.get("PLAYLIST_SIZE", "40"))
 HISTORY_FILE          = "playlist_history.xlsx"
 STATE_FILE            = "bot_state.json"
+
+# Cycle çalışıyor mu kontrolü (çift tetiklemeyi önler)
+is_running = False
 
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -62,6 +73,7 @@ def load_state() -> dict:
         "last_update": None,
         "cycle": 0,
         "feedback_history": [],
+        "mood_history": [],
         "ai_notes": ""
     }
 
@@ -139,26 +151,19 @@ def get_playlist_play_counts(sp, playlist_track_ids, recent_tracks):
     return counts
 
 
-# ── Playlist Bulma (çoklu playlist sorununu çözer) ─────────────────────────
+# ── Playlist Yönetimi ──────────────────────────────────────────────────────
 
 def find_or_create_playlist(sp: spotipy.Spotify, state: dict) -> str:
-    """
-    Önce state'deki ID'yi dene. Yoksa kullanıcının playlistlerinde
-    PLAYLIST_NAME ile eşleşeni bul (ilkini kullan, gerisini sil).
-    Hiç yoksa yeni oluştur.
-    """
     user_id = sp.current_user()["id"]
 
-    # State'de kayıtlı ID varsa doğrula
     if state.get("playlist_id"):
         try:
             pl = sp.playlist(state["playlist_id"])
-            log.info(f"Mevcut playlist kullanılıyor: {pl['name']} ({pl['id']})")
+            log.info(f"Mevcut playlist: {pl['name']} ({pl['id']})")
             return state["playlist_id"]
         except Exception:
             log.warning("State'deki playlist ID geçersiz, aranıyor...")
 
-    # Kullanıcının tüm playlistlerini tara
     matching = []
     offset = 0
     while True:
@@ -171,25 +176,22 @@ def find_or_create_playlist(sp: spotipy.Spotify, state: dict) -> str:
         offset += 50
 
     if matching:
-        # İlkini tut, gerisini sil
         keeper = matching[0]
         for duplicate in matching[1:]:
             try:
                 sp.current_user_unfollow_playlist(duplicate["id"])
-                log.info(f"Kopya playlist silindi: {duplicate['id']}")
+                log.info(f"Kopya silindi: {duplicate['id']}")
             except Exception as e:
                 log.warning(f"Kopya silinemedi: {e}")
-        log.info(f"Bulunan playlist kullanılıyor: {keeper['id']}")
         return keeper["id"]
 
-    # Hiç yoksa yeni oluştur
     pl = sp.user_playlist_create(
         user=user_id,
         name=PLAYLIST_NAME,
         public=False,
         description="🤖 Her 3 günde güncellenen AI playlist"
     )
-    log.info(f"Yeni playlist oluşturuldu: {pl['id']}")
+    log.info(f"Yeni playlist: {pl['id']}")
     return pl["id"]
 
 
@@ -198,10 +200,74 @@ def update_playlist(sp: spotipy.Spotify, playlist_id: str, track_ids: list):
     for i in range(0, len(track_ids), 100):
         chunk = [f"spotify:track:{tid}" for tid in track_ids[i:i+100]]
         sp.playlist_add_items(playlist_id, chunk)
-    log.info(f"Playlist güncellendi: {len(track_ids)} şarkı eklendi")
+    log.info(f"Playlist güncellendi: {len(track_ids)} şarkı")
 
 
-# ── AI Analizi (Groq) ─────────────────────────────────────────────────────
+# ── Ruh Hali Analizi ───────────────────────────────────────────────────────
+
+def analyze_mood(listening_data: dict, client: Groq) -> dict:
+    """
+    Son 3 günde dinlenen TÜM şarkıları (playlist dışı dahil) analiz eder,
+    ruh hali + müzik tercihi raporu üretir.
+    """
+    all_recent = listening_data.get("recent_tracks", [])
+    top_short = listening_data.get("top_short", [])
+    top_artists = listening_data.get("top_artists", [])
+
+    prompt = f"""Sen bir müzik psikolojisi uzmanısın. Kullanıcının son 3 günlük dinleme verisine bakarak ruh halini ve müzik tercihlerini analiz et.
+
+## Son 3 Günde Dinlenen Şarkılar (playlist dışı dahil tümü)
+{json.dumps(all_recent, ensure_ascii=False)}
+
+## Kısa Dönem En Çok Dinlenenler
+{json.dumps(top_short[:15], ensure_ascii=False)}
+
+## Favori Sanatçılar
+{json.dumps(top_artists[:8], ensure_ascii=False)}
+
+## Görev
+Bu verilere dayanarak:
+1. Genel ruh halini tahmin et (örn: melankolik, enerjik, nostaljik, huzurlu, kaygılı, mutlu...)
+2. Müzik tercih kalıplarını analiz et (tempo, tür, dil, sanatçı çeşitliliği)
+3. Bu dönemin öne çıkan özelliğini bir cümleyle özetle
+
+SADECE JSON döndür:
+{{
+  "mood": "Ana ruh hali kelimesi (Türkçe)",
+  "mood_emoji": "Uygun bir emoji",
+  "energy_level": "düşük/orta/yüksek",
+  "dominant_genres": ["tür1", "tür2"],
+  "top_artists_this_period": ["sanatçı1", "sanatçı2", "sanatçı3"],
+  "summary": "Bu dönemin müzik tercihlerini anlatan 2-3 cümlelik Türkçe özet",
+  "track_count": {len(all_recent)}
+}}"""
+
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return json.loads(raw.strip())
+    except Exception as e:
+        log.warning(f"Ruh hali analizi başarısız: {e}")
+        return {
+            "mood": "Bilinmiyor",
+            "mood_emoji": "🎵",
+            "energy_level": "orta",
+            "dominant_genres": [],
+            "top_artists_this_period": [],
+            "summary": "Analiz yapılamadı.",
+            "track_count": len(all_recent)
+        }
+
+
+# ── AI Playlist Analizi ────────────────────────────────────────────────────
 
 def ai_analyze_and_build(listening_data, play_counts, state, candidate_ids):
     client = Groq(api_key=GROQ_API_KEY)
@@ -214,6 +280,10 @@ def ai_analyze_and_build(listening_data, play_counts, state, candidate_ids):
             f"ortalama çalma sayısı {last['avg_plays']:.1f}. Notlar: {last.get('notes', '')}"
         )
 
+    # Ruh hali analizini de yap
+    mood_data = analyze_mood(listening_data, client)
+    log.info(f"Ruh hali: {mood_data.get('mood')} {mood_data.get('mood_emoji')}")
+
     prompt = f"""Sen bir müzik küratörü ve dinleme alışkanlıkları analistsin.
 Kullanıcının Spotify verilerini analiz edip en iyi {PLAYLIST_SIZE} şarkılık playlist önereceksin.
 
@@ -221,6 +291,9 @@ Kullanıcının Spotify verilerini analiz edip en iyi {PLAYLIST_SIZE} şarkılı
 Döngü #{state['cycle'] + 1}
 Önceki döngü notu: {state.get('ai_notes', 'İlk döngü.')}
 {feedback_summary}
+
+## Bu Dönem Ruh Hali Analizi
+{json.dumps(mood_data, ensure_ascii=False)}
 
 ## Son 3 Günlük Dinleme ({len(listening_data['recent_tracks'])} şarkı)
 {json.dumps(listening_data['recent_tracks'][:30], ensure_ascii=False)}
@@ -234,19 +307,19 @@ Döngü #{state['cycle'] + 1}
 ## Top Sanatçılar
 {json.dumps(listening_data['top_artists'][:10], ensure_ascii=False)}
 
-## Aday Şarkı ID'leri (bunlardan seç)
+## Aday Şarkı ID'leri
 {json.dumps(candidate_ids[:80], ensure_ascii=False)}
 
 ## Görev
-1. play_counts'a bakarak önceki playlistin ne kadar tuttuğunu değerlendir (çok çalınan = başarılı).
-2. Kullanıcının sıkıldığı şarkı/sanatçıları tespit et.
+1. play_counts'a bakarak önceki playlistin ne kadar tuttuğunu değerlendir.
+2. Ruh hali analizini de göz önünde bulundurarak bu döneme uygun şarkılar seç.
 3. Aday listesinden {PLAYLIST_SIZE} şarkı ID seç, çeşitlilik ekle, sıralamayı karıştır.
 
-SADECE JSON döndür, başka hiçbir şey yazma:
+SADECE JSON döndür:
 {{"track_ids": ["id1", "id2"], "score": 7.5, "analysis": "Türkçe kısa analiz", "notes": "sonraki döngü notu"}}"""
 
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",  # <-- Güncel ve aktif model
+        model="llama-3.3-70b-versatile",
         max_tokens=2000,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -264,90 +337,183 @@ SADECE JSON döndür, başka hiçbir şey yazma:
     analysis = parsed.get("analysis", "")
 
     log.info(f"AI analizi tamamlandı. Skor: {score}, Seçilen: {len(track_ids)} şarkı")
-    log.info(f"Analiz: {analysis}")
-    return track_ids, notes, score, analysis
+    return track_ids, notes, score, analysis, mood_data
 
 
 # ── Ana Döngü ─────────────────────────────────────────────────────────────
 
-def run_cycle():
-    log.info("═══════════ Yeni Döngü Başlıyor ═══════════")
+def run_cycle(manual=False):
+    global is_running
+    if is_running:
+        log.warning("Döngü zaten çalışıyor, atlandı.")
+        return {"status": "already_running"}
+
+    is_running = True
+    trigger = "Manuel" if manual else "Otomatik"
+    log.info(f"═══════════ Yeni Döngü Başlıyor ({trigger}) ═══════════")
+
+    try:
+        state = load_state()
+        sp = get_spotify()
+
+        playlist_id = find_or_create_playlist(sp, state)
+        state["playlist_id"] = playlist_id
+        save_state(state)
+
+        current_tracks = []
+        if state.get("last_update"):
+            try:
+                items = sp.playlist_items(playlist_id, fields="items(track(id,name,artists,album))")
+                for item in items["items"]:
+                    t = item["track"]
+                    if t and t.get("id"):
+                        current_tracks.append({
+                            "id": t["id"], "name": t["name"],
+                            "artist": t["artists"][0]["name"],
+                            "album": t["album"]["name"]
+                        })
+            except Exception as e:
+                log.warning(f"Playlist okunamadı: {e}")
+
+        listening_data = get_listening_data(sp)
+
+        play_counts = {}
+        avg_plays = 0
+        if current_tracks:
+            current_ids = [t["id"] for t in current_tracks]
+            play_counts = get_playlist_play_counts(sp, current_ids, listening_data["recent_tracks"])
+            avg_plays = sum(play_counts.values()) / max(len(play_counts), 1)
+
+        candidate_ids = list({
+            t["id"] for t in (
+                listening_data["top_short"] +
+                listening_data["top_medium"] +
+                listening_data["saved_tracks"] +
+                listening_data["recent_tracks"]
+            ) if t.get("id")
+        })
+
+        new_track_ids, ai_notes, score, analysis, mood_data = ai_analyze_and_build(
+            listening_data, play_counts, state, candidate_ids
+        )
+
+        if current_tracks:
+            save_to_excel(current_tracks, state["cycle"], score)
+
+        update_playlist(sp, playlist_id, new_track_ids)
+
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        state["cycle"] += 1
+        state["last_update"] = now
+        state["ai_notes"] = ai_notes
+
+        # Ruh hali geçmişine ekle
+        mood_entry = {
+            "date": now,
+            "cycle": state["cycle"],
+            "trigger": trigger,
+            **mood_data
+        }
+        if "mood_history" not in state:
+            state["mood_history"] = []
+        state["mood_history"].append(mood_entry)
+        state["mood_history"] = state["mood_history"][-30:]  # Son 30 döngü
+
+        state["feedback_history"].append({
+            "cycle": state["cycle"],
+            "date": now,
+            "score": score,
+            "avg_plays": avg_plays,
+            "analysis": analysis,
+            "notes": ai_notes
+        })
+        state["feedback_history"] = state["feedback_history"][-10:]
+        save_state(state)
+
+        log.info(f"═══════════ Döngü #{state['cycle']} Tamamlandı ═══════════")
+        return {"status": "ok", "cycle": state["cycle"], "tracks": len(new_track_ids), "mood": mood_data}
+
+    except Exception as e:
+        log.error(f"Döngü hatası: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}
+    finally:
+        is_running = False
+
+
+# ── Flask API ──────────────────────────────────────────────────────────────
+
+def check_auth(req):
+    secret = req.headers.get("X-API-Secret") or req.args.get("secret")
+    return secret == API_SECRET
+
+
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "bot": "Spotify AI Playlist Bot"})
+
+
+@app.route("/status", methods=["GET"])
+def status():
+    if not check_auth(request):
+        return jsonify({"error": "Unauthorized"}), 401
     state = load_state()
-    sp = get_spotify()
-
-    # Tek playlist bul/oluştur (kopya varsa temizle)
-    playlist_id = find_or_create_playlist(sp, state)
-    state["playlist_id"] = playlist_id
-    save_state(state)  # ID'yi hemen kaydet
-
-    # Mevcut playlist şarkılarını oku
-    current_tracks = []
-    if state.get("last_update"):
-        try:
-            items = sp.playlist_items(playlist_id, fields="items(track(id,name,artists,album))")
-            for item in items["items"]:
-                t = item["track"]
-                if t and t.get("id"):
-                    current_tracks.append({
-                        "id": t["id"], "name": t["name"],
-                        "artist": t["artists"][0]["name"],
-                        "album": t["album"]["name"]
-                    })
-        except Exception as e:
-            log.warning(f"Playlist okunamadı: {e}")
-
-    listening_data = get_listening_data(sp)
-
-    play_counts = {}
-    avg_plays = 0
-    if current_tracks:
-        current_ids = [t["id"] for t in current_tracks]
-        play_counts = get_playlist_play_counts(sp, current_ids, listening_data["recent_tracks"])
-        avg_plays = sum(play_counts.values()) / max(len(play_counts), 1)
-        log.info(f"Mevcut playlist ort. çalma: {avg_plays:.1f}")
-
-    candidate_ids = list({
-        t["id"] for t in (
-            listening_data["top_short"] +
-            listening_data["top_medium"] +
-            listening_data["saved_tracks"] +
-            listening_data["recent_tracks"]
-        ) if t.get("id")
+    return jsonify({
+        "cycle": state.get("cycle", 0),
+        "last_update": state.get("last_update"),
+        "playlist_id": state.get("playlist_id"),
+        "is_running": is_running,
+        "feedback_history": state.get("feedback_history", []),
+        "mood_history": state.get("mood_history", [])
     })
 
-    new_track_ids, ai_notes, score, analysis = ai_analyze_and_build(
-        listening_data, play_counts, state, candidate_ids
-    )
 
-    if current_tracks:
-        save_to_excel(current_tracks, state["cycle"], score)
+@app.route("/trigger", methods=["POST"])
+def trigger():
+    if not check_auth(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    if is_running:
+        return jsonify({"status": "already_running", "message": "Bot zaten çalışıyor"}), 409
 
-    update_playlist(sp, playlist_id, new_track_ids)
+    # Ayrı thread'de çalıştır, HTTP timeout olmasın
+    def run():
+        run_cycle(manual=True)
 
-    state["cycle"] += 1
-    state["last_update"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    state["ai_notes"] = ai_notes
-    state["feedback_history"].append({
-        "cycle": state["cycle"],
-        "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "score": score,
-        "avg_plays": avg_plays,
-        "analysis": analysis,
-        "notes": ai_notes
-    })
-    state["feedback_history"] = state["feedback_history"][-10:]
-    save_state(state)
-
-    log.info(f"═══════════ Döngü #{state['cycle']} Tamamlandı ═══════════")
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return jsonify({"status": "started", "message": "Döngü başlatıldı"})
 
 
-def main():
-    log.info("Spotify AI Bot başlatıldı.")
-    run_cycle()
+@app.route("/mood-history", methods=["GET"])
+def mood_history():
+    if not check_auth(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    state = load_state()
+    return jsonify(state.get("mood_history", []))
+
+
+# ── Scheduler + Flask birlikte ─────────────────────────────────────────────
+
+def scheduler_loop():
     schedule.every(72).hours.do(run_cycle)
     while True:
         schedule.run_pending()
         time.sleep(60)
+
+
+def main():
+    log.info("Spotify AI Bot başlatıldı.")
+
+    # İlk çalıştırmada hemen döngü başlat (ayrı thread)
+    t = threading.Thread(target=run_cycle, daemon=True)
+    t.start()
+
+    # Scheduler ayrı thread'de
+    s = threading.Thread(target=scheduler_loop, daemon=True)
+    s.start()
+
+    # Flask ana thread'de çalışsın
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":
