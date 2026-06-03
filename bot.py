@@ -284,8 +284,25 @@ SADECE JSON döndür:
                 "summary": "Analiz yapılamadı.", "track_count": len(all_recent)}
 
 
-def ai_analyze_and_build(listening_data, play_counts, state, candidate_ids):
+MAX_CARRY_OVER = 5  # Eski playlistten yeni playliste geçebilecek max şarkı sayısı
+
+def ai_analyze_and_build(listening_data, play_counts, state, candidate_ids, current_track_ids=None):
     client = Groq(api_key=GROQ_API_KEY)
+
+    current_track_ids = current_track_ids or []
+
+    # Eski playlistten en çok çalınan MAX_CARRY_OVER şarkıyı belirle
+    if current_track_ids and play_counts:
+        sorted_old = sorted(play_counts.items(), key=lambda x: x[1], reverse=True)
+        carry_over_pool = [tid for tid, count in sorted_old if count > 0][:MAX_CARRY_OVER]
+        banned_ids = [tid for tid in current_track_ids if tid not in carry_over_pool]
+    else:
+        carry_over_pool = []
+        banned_ids = current_track_ids
+
+    # Aday listesinden yasak şarkıları çıkar
+    fresh_candidates = [tid for tid in candidate_ids if tid not in banned_ids]
+    log.info(f"Aday: {len(fresh_candidates)} taze + {len(carry_over_pool)} taşınabilir eski şarkı")
 
     feedback_summary = ""
     if state["feedback_history"]:
@@ -304,9 +321,21 @@ Son dinlenenler: {json.dumps(listening_data['recent_tracks'][:30], ensure_ascii=
 Top şarkılar: {json.dumps(listening_data['top_short'][:20], ensure_ascii=False)}
 Çalma sayıları: {json.dumps(play_counts, ensure_ascii=False)}
 Top sanatçılar: {json.dumps(listening_data['top_artists'][:10], ensure_ascii=False)}
-Aday ID'ler: {json.dumps(candidate_ids[:80], ensure_ascii=False)}
 
-Görev: play_counts'a bakarak önceki playlistin başarısını değerlendir. Ruh haline uygun {PLAYLIST_SIZE} şarkı seç, çeşitlilik ekle.
+## TAZE ADAY ŞARKILAR (öncelikli olarak bunlardan seç)
+{json.dumps(fresh_candidates[:80], ensure_ascii=False)}
+
+## TAŞINABİLİR ESKİ ŞARKILAR (geçen dönem çok çalındı, en fazla {MAX_CARRY_OVER} tane kullanabilirsin)
+{json.dumps(carry_over_pool, ensure_ascii=False)}
+
+## KESİNLİKLE YASAK (bu şarkıları ekleme)
+{json.dumps(banned_ids[:50], ensure_ascii=False)}
+
+Görev:
+1. Taze aday şarkılardan en az {PLAYLIST_SIZE - MAX_CARRY_OVER} şarkı seç.
+2. Taşınabilir eski şarkılardan en fazla {MAX_CARRY_OVER} tane ekleyebilirsin.
+3. Yasak listesindeki şarkıları KESİNLİKLE ekleme.
+4. Ruh haline uygun seç, çeşitlilik ekle, sıralamayı karıştır.
 
 SADECE JSON:
 {{"track_ids":["id1","id2"],"score":7.5,"analysis":"Türkçe analiz","notes":"sonraki döngü notu"}}"""
@@ -321,7 +350,18 @@ SADECE JSON:
     parsed = json.loads(raw.strip())
 
     track_ids = parsed.get("track_ids", [])[:PLAYLIST_SIZE]
-    log.info(f"AI tamamlandı. Skor: {parsed.get('score')}, Seçilen: {len(track_ids)}")
+
+    # Kod tarafında da zorla: yasak şarkıları çıkar, carry_over limitini uygula
+    carry_over_used = [tid for tid in track_ids if tid in carry_over_pool]
+    if len(carry_over_used) > MAX_CARRY_OVER:
+        excess = set(carry_over_used[MAX_CARRY_OVER:])
+        track_ids = [tid for tid in track_ids if tid not in excess]
+        log.info(f"Carry-over limiti: {len(excess)} fazla şarkı çıkarıldı")
+    track_ids = [tid for tid in track_ids if tid not in banned_ids]
+
+    fresh_count = len([tid for tid in track_ids if tid not in current_track_ids])
+    carry_count = len([tid for tid in track_ids if tid in carry_over_pool])
+    log.info(f"AI tamamlandı. Skor: {parsed.get('score')}, Taze: {fresh_count}, Eski: {carry_count}, Toplam: {len(track_ids)}")
     return track_ids, parsed.get("notes",""), float(parsed.get("score",5.0)), parsed.get("analysis",""), mood_data
 
 
@@ -370,8 +410,9 @@ def run_cycle(manual=False):
             listening_data["saved_tracks"] + listening_data["recent_tracks"]
         ) if t.get("id")})
 
+        current_ids_for_ai = [t['id'] for t in current_tracks]
         new_track_ids, ai_notes, score, analysis, mood_data = ai_analyze_and_build(
-            listening_data, play_counts, state, candidate_ids)
+            listening_data, play_counts, state, candidate_ids, current_ids_for_ai)
 
         if current_tracks:
             save_to_excel(current_tracks, state["cycle"], score)
