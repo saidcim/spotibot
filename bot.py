@@ -490,7 +490,7 @@ def mood_history():
 # ── Başlat ─────────────────────────────────────────────────────────────────
 
 def scheduler_loop():
-    schedule.every(72).hours.do(run_cycle)
+    schedule.every(48).hours.do(run_cycle)
     while True:
         schedule.run_pending()
         time.sleep(60)
