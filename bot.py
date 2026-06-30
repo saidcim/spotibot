@@ -467,9 +467,14 @@ def analyze_patterns(state: dict, listening_data: dict, play_counts: dict,
 
 
 def tune_dynamic_config(state: dict, client: Groq) -> dict:
-    """AI, geçmiş döngülerin skor/çalma trendine bakarak carry_over için yeni değer önerir.
-    Öneri her zaman güvenlik sınırları içine clamp edilir, ve döngü başına en fazla ±1
-    değişebilir — ani sıçramalar önlenir. playlist_size sabittir, değiştirilmez."""
+    """AI, geçmiş döngülerin çalma oranına bakarak carry_over'ı AZALTABİLİR ama ASLA ARTIRAMAZ.
+
+    Mantık: Bu bot tekrarı azaltmak için var. Eski playlist az dinlendiyse (kullanıcı
+    sıkıldı/beğenmedi) → carry_over düşsün, daha az eski şarkı taşınsın.
+    Eski playlist çok dinlendiyse → bu "daha fazla taşı" anlamına GELMEZ; çok dinlenen
+    şarkılar da fazla tekrar edince sıkıcı olur. O yüzden artış hiçbir koşulda yapılmaz.
+    carry_over sadece varsayılan tavanından (DEFAULT_CARRY_OVER) aşağı inebilir, geri
+    yukarı çıkamaz — tek yönlü, kalıcı bir daralma eğrisi."""
     dyn = state.get("dynamic_config", _default_dynamic_config())
     archive = state.get("playlist_archive", [])[-6:]
 
@@ -482,18 +487,21 @@ def tune_dynamic_config(state: dict, client: Groq) -> dict:
         for a in archive
     ]
 
-    prompt = f"""Sen bir playlist strateji uzmanısın. Aşağıdaki geçmiş döngü verilerine bakarak
-carry_over (eski şarkılardan taşınabilecek max sayı) için öneri ver.
+    prompt = f"""Sen bir playlist strateji uzmanısın. Bu botun amacı kullanıcının hep aynı
+şarkıları dinlemekten sıkılmasını önlemek. Bu yüzden carry_over (eski playlistten yeni
+playliste taşınacak şarkı sayısı) parametresi SADECE AZALTILABİLİR, asla artırılamaz.
 
 ## Mevcut Değer
-carry_over: {dyn['carry_over']} (izin verilen aralık: {CARRY_OVER_MIN}-{CARRY_OVER_MAX})
+carry_over: {dyn['carry_over']} (mutlak alt sınır: {CARRY_OVER_MIN}, bu döngüde çıkabileceği en yüksek değer: {dyn['carry_over']} — yani sadece eşit kalabilir ya da düşebilir)
 
-## Son Döngüler (skor ve ortalama çalma sayısı yüksekse kullanıcı playlist'i beğeniyor demektir)
+## Son Döngüler (avg_plays = eski playlist'teki şarkıların ortalama kaç kez çalındığı)
 {json.dumps(history_summary, ensure_ascii=False)}
 
-Görev: Eğer skor/çalma trendi düşüyorsa ya da kullanıcı geri bildiriminde tekrar/sıkılma
-işareti varsa carry_over'ı azaltmayı düşün. Trend iyiyse mevcut değeri koru. Değişiklik öner
-ama KÜÇÜK ADIMLARLA (en fazla ±1).
+Görev: Eğer son döngülerde avg_plays veya skor düşükse (kullanıcı eski playlist'i az
+dinledi/beğenmedi) carry_over'ı 1 azaltmayı öner. Eğer avg_plays YÜKSEKSE bu bir artış
+sebebi DEĞİLDİR — çok dinlenmiş olması bile aynı şarkıların tekrar tekrar gelmesini
+haklı çıkarmaz, bu durumda mevcut değeri koru, asla artırma. Sadece düşüş öner ya da
+"değişiklik yok" de.
 
 SADECE JSON:
 {{"carry_over": {dyn['carry_over']}, "reason": "kısa Türkçe gerekçe"}}"""
@@ -505,18 +513,20 @@ SADECE JSON:
         )
         parsed = _parse_ai_json(resp.choices[0].message.content)
 
-        new_carry = int(parsed.get("carry_over", dyn["carry_over"]))
-        # Adım sınırı: tek seferde büyük sıçrama olmasın
-        new_carry = dyn["carry_over"] + max(-1, min(1, new_carry - dyn["carry_over"]))
-        # Güvenlik sınırları
-        new_carry = max(CARRY_OVER_MIN, min(CARRY_OVER_MAX, new_carry))
-        new_carry = min(new_carry, PLAYLIST_SIZE)  # carry_over playlist_size'ı geçemez
+        proposed = int(parsed.get("carry_over", dyn["carry_over"]))
+
+        # TEK YÖNLÜ KURAL: AI ne önerirse önersin, kod seviyesinde artış kesinlikle reddedilir.
+        # Sadece eşit kalabilir veya en fazla 1 birim azalabilir.
+        new_carry = dyn["carry_over"] if proposed >= dyn["carry_over"] else dyn["carry_over"] - 1
+        new_carry = max(CARRY_OVER_MIN, min(new_carry, PLAYLIST_SIZE))
 
         if new_carry != dyn["carry_over"]:
             log.info(
-                f"Dynamic config güncellendi: carry_over {dyn['carry_over']}→{new_carry} "
-                f"| Gerekçe: {parsed.get('reason', '')}"
+                f"Dynamic config güncellendi (tek yönlü, sadece azalış): "
+                f"carry_over {dyn['carry_over']}→{new_carry} | Gerekçe: {parsed.get('reason', '')}"
             )
+        elif proposed > dyn["carry_over"]:
+            log.info(f"AI artış önerdi ({dyn['carry_over']}→{proposed}) ama tek yönlü kural gereği reddedildi, değer korunuyor.")
 
         dyn["carry_over"] = new_carry
         dyn["last_tuned_cycle"] = state.get("cycle", 0)
