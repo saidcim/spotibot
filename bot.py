@@ -12,7 +12,6 @@ import logging
 import datetime
 import threading
 import openpyxl
-import schedule
 import spotipy
 import requests
 from spotipy.oauth2 import SpotifyOAuth
@@ -924,24 +923,47 @@ def mood_history():
 
 # ── Başlat ─────────────────────────────────────────────────────────────────
 
-def should_run_on_startup(state: dict) -> bool:
-    if not state.get("last_update"):
-        return True
+CYCLE_HOURS = 48
+SCHEDULER_CHECK_INTERVAL_SECONDS = 300  # 5 dakikada bir kontrol et
+
+
+def _hours_since_last_update(state: dict) -> float | None:
+    last = state.get("last_update")
+    if not last:
+        return None
     try:
-        last = datetime.datetime.fromisoformat(state["last_update"])
-        if last.tzinfo is None:
-            last = last.replace(tzinfo=datetime.timezone.utc)
+        last_dt = datetime.datetime.fromisoformat(last)
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=datetime.timezone.utc)
         now = datetime.datetime.now(datetime.timezone.utc)
-        return (now - last) > datetime.timedelta(hours=47)
+        return (now - last_dt).total_seconds() / 3600
     except Exception:
-        return True
+        return None
+
+
+def should_run_on_startup(state: dict) -> bool:
+    hours = _hours_since_last_update(state)
+    return hours is None or hours > (CYCLE_HOURS - 1)
 
 
 def scheduler_loop():
-    schedule.every(48).hours.do(run_cycle)
+    """Sabit schedule.every() yerine her kontrolde state'teki son güncelleme zamanına
+    bakar. Bu sayede manuel tetikleme (/trigger) de last_update'i güncellediği için,
+    bir sonraki otomatik döngü manuel tetiklemeden CYCLE_HOURS saat sonra çalışır —
+    sabit bir saatte değil, gerçek son güncellemeden itibaren."""
     while True:
-        schedule.run_pending()
-        time.sleep(60)
+        try:
+            if not is_running:
+                state = load_state()
+                hours = _hours_since_last_update(state)
+                if hours is None or hours >= CYCLE_HOURS:
+                    log.info(
+                        f"Otomatik döngü zamanı geldi (son güncellemeden {hours if hours is not None else '∞'} saat geçti)."
+                    )
+                    run_cycle(manual=False)
+        except Exception as e:
+            log.warning(f"Scheduler kontrol hatası: {e}")
+        time.sleep(SCHEDULER_CHECK_INTERVAL_SECONDS)
 
 
 def main():
@@ -951,7 +973,8 @@ def main():
         log.info("Startup döngüsü başlatılıyor.")
         threading.Thread(target=run_cycle, daemon=True).start()
     else:
-        log.info("Son güncelleme 47 saatten yakın, startup döngüsü atlandı.")
+        hours = _hours_since_last_update(state)
+        log.info(f"Son güncellemeden {hours:.1f} saat geçmiş, startup döngüsü atlandı.")
     threading.Thread(target=scheduler_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
