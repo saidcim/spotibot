@@ -52,7 +52,12 @@ STATE_FILE   = os.path.join(DATA_DIR, "bot_state.json")
 STATE_VAR    = "BOT_STATE"
 
 ARCHIVE_LIMIT = 50
-MAX_CARRY_OVER = 5
+
+# carry_over artık sabit değil — AI, geri bildirim trendine bakarak
+# state["dynamic_config"]["carry_over"] içindeki değeri önerir (bkz. tune_dynamic_config()).
+# playlist_size ise SABİT kalır (PLAYLIST_SIZE env değişkeninden).
+DEFAULT_CARRY_OVER = 5
+CARRY_OVER_MIN, CARRY_OVER_MAX = 0, 10
 
 is_running = False
 
@@ -78,6 +83,14 @@ def _default_user_profile() -> dict:
     }
 
 
+def _default_dynamic_config() -> dict:
+    return {
+        "carry_over": DEFAULT_CARRY_OVER,
+        "last_tuned_cycle": 0,
+        "tune_reason": "",
+    }
+
+
 def _default_state() -> dict:
     return {
         "playlist_id": os.environ.get("PLAYLIST_ID", ""),
@@ -87,6 +100,7 @@ def _default_state() -> dict:
         "mood_history": [],
         "playlist_archive": [],
         "user_profile": _default_user_profile(),
+        "dynamic_config": _default_dynamic_config(),
         "ai_notes": "",
     }
 
@@ -126,6 +140,16 @@ def _merge_state_defaults(state: dict) -> dict:
         for k, v in metrics.items():
             if k not in state["user_profile"].get("adaptation_metrics", {}):
                 state["user_profile"]["adaptation_metrics"][k] = v
+
+    dyn_default = _default_dynamic_config()
+    dyn = state.get("dynamic_config") or {}
+    for k, v in dyn_default.items():
+        if k not in dyn:
+            dyn[k] = v
+    # Güvenlik: state bozulmuş/elle değiştirilmiş olsa bile sınırların dışına çıkmasın
+    dyn["carry_over"] = max(CARRY_OVER_MIN, min(CARRY_OVER_MAX, int(dyn["carry_over"])))
+    dyn["carry_over"] = min(dyn["carry_over"], PLAYLIST_SIZE)  # carry_over playlist_size'ı geçemez
+    state["dynamic_config"] = dyn
     return state
 
 
@@ -408,7 +432,8 @@ def analyze_patterns(state: dict, listening_data: dict, play_counts: dict,
                     existing.append(g)
             mood_music_map[last_mood] = existing[:5]
 
-    carry_plays = sum(play_counts.get(tid, 0) for tid in current_track_ids[:MAX_CARRY_OVER])
+    carry_limit = state.get("dynamic_config", {}).get("carry_over", DEFAULT_CARRY_OVER)
+    carry_plays = sum(play_counts.get(tid, 0) for tid in current_track_ids[:carry_limit])
     total_plays = sum(play_counts.values()) or 1
     carry_rate = carry_plays / total_plays if current_track_ids else 0.0
 
@@ -439,6 +464,67 @@ def analyze_patterns(state: dict, listening_data: dict, play_counts: dict,
     }
     profile["last_updated"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     return profile
+
+
+def tune_dynamic_config(state: dict, client: Groq) -> dict:
+    """AI, geçmiş döngülerin skor/çalma trendine bakarak carry_over için yeni değer önerir.
+    Öneri her zaman güvenlik sınırları içine clamp edilir, ve döngü başına en fazla ±1
+    değişebilir — ani sıçramalar önlenir. playlist_size sabittir, değiştirilmez."""
+    dyn = state.get("dynamic_config", _default_dynamic_config())
+    archive = state.get("playlist_archive", [])[-6:]
+
+    if len(archive) < 3:
+        return dyn  # yeterli geçmiş yok, mevcut değerle devam
+
+    history_summary = [
+        {"cycle": a.get("cycle"), "score": a.get("score"), "avg_plays": a.get("avg_plays"),
+         "carry_over_count": a.get("carry_over_count")}
+        for a in archive
+    ]
+
+    prompt = f"""Sen bir playlist strateji uzmanısın. Aşağıdaki geçmiş döngü verilerine bakarak
+carry_over (eski şarkılardan taşınabilecek max sayı) için öneri ver.
+
+## Mevcut Değer
+carry_over: {dyn['carry_over']} (izin verilen aralık: {CARRY_OVER_MIN}-{CARRY_OVER_MAX})
+
+## Son Döngüler (skor ve ortalama çalma sayısı yüksekse kullanıcı playlist'i beğeniyor demektir)
+{json.dumps(history_summary, ensure_ascii=False)}
+
+Görev: Eğer skor/çalma trendi düşüyorsa ya da kullanıcı geri bildiriminde tekrar/sıkılma
+işareti varsa carry_over'ı azaltmayı düşün. Trend iyiyse mevcut değeri koru. Değişiklik öner
+ama KÜÇÜK ADIMLARLA (en fazla ±1).
+
+SADECE JSON:
+{{"carry_over": {dyn['carry_over']}, "reason": "kısa Türkçe gerekçe"}}"""
+
+    try:
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile", max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        parsed = _parse_ai_json(resp.choices[0].message.content)
+
+        new_carry = int(parsed.get("carry_over", dyn["carry_over"]))
+        # Adım sınırı: tek seferde büyük sıçrama olmasın
+        new_carry = dyn["carry_over"] + max(-1, min(1, new_carry - dyn["carry_over"]))
+        # Güvenlik sınırları
+        new_carry = max(CARRY_OVER_MIN, min(CARRY_OVER_MAX, new_carry))
+        new_carry = min(new_carry, PLAYLIST_SIZE)  # carry_over playlist_size'ı geçemez
+
+        if new_carry != dyn["carry_over"]:
+            log.info(
+                f"Dynamic config güncellendi: carry_over {dyn['carry_over']}→{new_carry} "
+                f"| Gerekçe: {parsed.get('reason', '')}"
+            )
+
+        dyn["carry_over"] = new_carry
+        dyn["last_tuned_cycle"] = state.get("cycle", 0)
+        dyn["tune_reason"] = parsed.get("reason", "")
+    except Exception as e:
+        log.warning(f"Dynamic config tuning başarısız, mevcut değer korunuyor: {e}")
+
+    return dyn
 
 
 def _parse_ai_json(raw: str) -> dict:
@@ -568,9 +654,13 @@ def ai_analyze_and_build(listening_data, play_counts, state, candidate_ids, curr
     client = Groq(api_key=GROQ_API_KEY)
     current_track_ids = current_track_ids or []
 
+    dyn = state.get("dynamic_config", _default_dynamic_config())
+    carry_over_limit = dyn["carry_over"]
+    playlist_size = PLAYLIST_SIZE
+
     if current_track_ids and play_counts:
         sorted_old = sorted(play_counts.items(), key=lambda x: x[1], reverse=True)
-        carry_over_pool = [tid for tid, count in sorted_old if count > 0][:MAX_CARRY_OVER]
+        carry_over_pool = [tid for tid, count in sorted_old if count > 0][:carry_over_limit]
         banned_ids = [tid for tid in current_track_ids if tid not in carry_over_pool]
     else:
         carry_over_pool = []
@@ -583,7 +673,7 @@ def ai_analyze_and_build(listening_data, play_counts, state, candidate_ids, curr
     mood_data = analyze_mood(listening_data, client)
     log.info(f"Ruh hali: {mood_data.get('mood')} {mood_data.get('mood_emoji')}")
 
-    prompt = f"""Sen bir müzik küratörüsün. {PLAYLIST_SIZE} şarkılık playlist seç.
+    prompt = f"""Sen bir müzik küratörüsün. {playlist_size} şarkılık playlist seç.
 
 {learning_context}
 
@@ -597,7 +687,7 @@ Top sanatçılar: {json.dumps(listening_data['top_artists'][:10], ensure_ascii=F
 ## TAZE ADAY ŞARKILAR (öncelikli olarak bunlardan seç)
 {json.dumps(fresh_candidates[:80], ensure_ascii=False)}
 
-## TAŞINABİLİR ESKİ ŞARKILAR (geçen dönem çok çalındı, en fazla {MAX_CARRY_OVER} tane kullanabilirsin)
+## TAŞINABİLİR ESKİ ŞARKILAR (geçen dönem çok çalındı, en fazla {carry_over_limit} tane kullanabilirsin)
 {json.dumps(carry_over_pool, ensure_ascii=False)}
 
 ## KESİNLİKLE YASAK (bu şarkıları ekleme)
@@ -605,8 +695,8 @@ Top sanatçılar: {json.dumps(listening_data['top_artists'][:10], ensure_ascii=F
 
 Görev:
 1. Öğrenilen profil ve örüntülere göre seçim yap — kullanıcıyı tanıdığını göster.
-2. Taze aday şarkılardan en az {PLAYLIST_SIZE - MAX_CARRY_OVER} şarkı seç.
-3. Taşınabilir eski şarkılardan en fazla {MAX_CARRY_OVER} tane ekleyebilirsin.
+2. Taze aday şarkılardan en az {playlist_size - carry_over_limit} şarkı seç.
+3. Taşınabilir eski şarkılardan en fazla {carry_over_limit} tane ekleyebilirsin.
 4. Yasak listesindeki şarkıları KESİNLİKLE ekleme.
 5. Ruh haline uygun seç, çeşitlilik ekle, sıralamayı karıştır.
 
@@ -618,11 +708,11 @@ SADECE JSON:
         messages=[{"role": "user", "content": prompt}],
     )
     parsed = _parse_ai_json(resp.choices[0].message.content)
-    track_ids = parsed.get("track_ids", [])[:PLAYLIST_SIZE]
+    track_ids = parsed.get("track_ids", [])[:playlist_size]
 
     carry_over_used = [tid for tid in track_ids if tid in carry_over_pool]
-    if len(carry_over_used) > MAX_CARRY_OVER:
-        excess = set(carry_over_used[MAX_CARRY_OVER:])
+    if len(carry_over_used) > carry_over_limit:
+        excess = set(carry_over_used[carry_over_limit:])
         track_ids = [tid for tid in track_ids if tid not in excess]
         log.info(f"Carry-over limiti: {len(excess)} fazla şarkı çıkarıldı")
     track_ids = [tid for tid in track_ids if tid not in banned_ids]
@@ -680,6 +770,7 @@ def run_cycle(manual=False):
 
         groq_client = Groq(api_key=GROQ_API_KEY)
         state["user_profile"] = synthesize_user_profile(state, listening_data, groq_client)
+        state["dynamic_config"] = tune_dynamic_config(state, groq_client)
 
         candidate_ids = list({t["id"] for t in (
             listening_data["top_short"] + listening_data["top_medium"] +
@@ -780,6 +871,7 @@ def status():
         "feedback_history": state.get("feedback_history", []),
         "mood_history": state.get("mood_history", []),
         "user_profile": state.get("user_profile", {}),
+        "dynamic_config": state.get("dynamic_config", {}),
         "playlist_archive_summary": state.get("playlist_archive", [])[-10:],
     })
 
